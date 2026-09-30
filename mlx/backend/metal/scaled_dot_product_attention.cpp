@@ -814,6 +814,22 @@ std::tuple<bool, std::string> has_fused_kernel(
       return {false, msg.str()};
     }
     if (query_sequence_length * gqa_factor > 32) {
+      // The fused vector kernel packs (gqa_factor * qL) simdgroups into a
+      // single threadgroup and hits Metal's 32-simdgroup-per-TG limit when
+      // qL * gqa > 32. For multi-token queries (qL in (1, 8]) fall through
+      // to the full-attention (GEMM-based) kernel instead of the naive
+      // fallback -- provided the head dim is supported by that kernel.
+      // This is critical for speculative-decoding verify steps on high-GQA
+      // models (e.g. Qwen3, gqa=8, verify M=8).
+      const bool full_hd = (query_head_dim == value_head_dim) &&
+          (query_head_dim == 64 || query_head_dim == 72 ||
+           query_head_dim == 80 || query_head_dim == 96 ||
+           query_head_dim == 128 || query_head_dim == 192 ||
+           query_head_dim == 256);
+      if (query_sequence_length > 1 && full_hd) {
+        // has_fused = true; eval_gpu routes qL>1 && qL*gqa>32 to full attn.
+        return {true, ""};
+      }
       msg << "the vector attention kernel requires the query length times "
           << "the GQA factor to be at most 32; got query length "
           << query_sequence_length << " and GQA factor " << gqa_factor << ".";
@@ -1304,7 +1320,12 @@ void ScaledDotProductAttention::eval_gpu(
   bool has_arr_mask = inputs.size() > (3 + has_sinks_);
 
   // We are in vector mode ie single query
-  if (q_pre.shape(2) <= 8) {
+  // Route qL > 1 && qL * gqa > 32 to the full-attention (steel) branch: the
+  // fused vector kernel cannot fit that many simdgroups into a threadgroup.
+  int gqa_factor_pre = q_pre.shape(1) / k_pre.shape(1);
+  bool use_full_for_multi_q =
+      q_pre.shape(2) > 1 && q_pre.shape(2) * gqa_factor_pre > 32;
+  if (q_pre.shape(2) <= 8 && !use_full_for_multi_q) {
     if (outputs.size() > 1) {
       throw std::runtime_error(
           "[scaled_dot_product_attention] the vector kernels do not produce a "
